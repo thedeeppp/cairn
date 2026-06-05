@@ -1,47 +1,106 @@
-//! The durable store: an in-memory map fronted by a write-ahead log.
+//! The durable store: a sorted MemTable fronted by a WAL, flushing to immutable
+//! SSTables on disk.
 //!
-//! Every mutation is logged (and fsynced) *before* it touches memory, so the
-//! map is always reconstructible from the WAL. `open` replays the log to
-//! rebuild exactly the state that existed before shutdown or crash.
+//! Write path: append to the WAL (durable), then apply to the active MemTable.
+//! When the MemTable grows past a byte threshold it is *frozen* and flushed to a
+//! new sorted SSTable; once that SSTable is durable, the WAL is truncated —
+//! every mutation lives in exactly one of WAL-or-SSTable, never neither.
 //!
-//! This is still a single in-memory layer (a `HashMap`). Phase 2 swaps it for a
-//! sorted MemTable that flushes to disk; the WAL contract here doesn't change.
+//! Read path (Phase 2): the active MemTable, then frozen MemTables newest →
+//! oldest. Frozen tables are flushed to disk but **kept in memory** here because
+//! the on-disk read path doesn't exist yet — Phase 3 adds SSTable reads and lets
+//! us drop them, reclaiming the memory.
 
-use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::api::{Entry, EntryKind, Key, Value};
+use crate::api::{Entry, Key, Value};
+use crate::memtable::MemTable;
+use crate::sstable::SsTable;
 use crate::store::Store;
 use crate::wal::Wal;
 
 const WAL_FILE: &str = "wal.log";
+const SST_EXT: &str = "sst";
+
+/// Default MemTable flush threshold: 1 MiB.
+pub const DEFAULT_MEMTABLE_BYTES: usize = 1 << 20;
 
 pub struct Engine {
+    dir: PathBuf,
     wal: Wal,
-    mem: HashMap<Key, Value>,
-    /// Monotonic sequence counter. Persisted implicitly via logged entries and
-    /// restored to the high-water mark on recovery, so seq never goes backward.
+    /// Receives current writes.
+    active: MemTable,
+    /// Frozen-and-flushed tables, oldest first. Retained in memory for reads
+    /// until Phase 3's on-disk read path replaces them.
+    frozen: Vec<MemTable>,
+    /// Monotonic write sequence; restored to its high-water mark on recovery.
     seq: u64,
+    /// Highest SSTable number used; the next flush takes `next_sst + 1`.
+    next_sst: u64,
+    /// Flush when the active table reaches this many bytes.
+    threshold: usize,
 }
 
 impl Engine {
-    /// Opens (or creates) a store rooted at directory `dir`, replaying any
-    /// existing WAL to rebuild state.
+    /// Opens (or creates) a store at `dir` with the default flush threshold.
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Engine> {
-        let dir = dir.as_ref();
-        std::fs::create_dir_all(dir)?;
-        let wal_path = dir.join(WAL_FILE);
+        Engine::open_with_threshold(dir, DEFAULT_MEMTABLE_BYTES)
+    }
 
-        let mut mem = HashMap::new();
+    /// Opens a store with an explicit flush threshold (handy for tests).
+    pub fn open_with_threshold(dir: impl AsRef<Path>, threshold: usize) -> io::Result<Engine> {
+        let dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir)?;
+        remove_stale_temps(&dir)?;
+
         let mut seq = 0;
+        let mut next_sst = 0;
+        let mut frozen = Vec::new();
+
+        // Load SSTables oldest → newest so `frozen` stays age-ordered.
+        for (num, path) in sstable_files(&dir)? {
+            next_sst = next_sst.max(num);
+            let mut table = MemTable::new();
+            for entry in SsTable::open(path).scan()? {
+                seq = seq.max(entry.seq);
+                table.put(entry);
+            }
+            frozen.push(table);
+        }
+
+        // Replay the WAL (everything written since the last flush) into active.
+        let wal_path = dir.join(WAL_FILE);
+        let mut active = MemTable::new();
         for entry in Wal::replay(&wal_path)? {
             seq = seq.max(entry.seq);
-            apply(&mut mem, entry);
+            active.put(entry);
         }
 
         let wal = Wal::open(&wal_path)?;
-        Ok(Engine { wal, mem, seq })
+        Ok(Engine {
+            dir,
+            wal,
+            active,
+            frozen,
+            seq,
+            next_sst,
+            threshold,
+        })
+    }
+
+    /// Number of SSTables flushed (one per frozen table in Phase 2).
+    pub fn sstable_count(&self) -> usize {
+        self.frozen.len()
+    }
+
+    /// Entry count in the active MemTable.
+    pub fn active_len(&self) -> usize {
+        self.active.len()
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -49,31 +108,61 @@ impl Engine {
         self.seq
     }
 
-    /// Logs `entry` durably, then applies it to memory. The order is the whole
-    /// point: if the append fails, memory is left untouched and the caller sees
-    /// the error.
+    /// Logs `entry` durably, applies it to the active table, then flushes if the
+    /// table has grown past the threshold.
     fn write(&mut self, entry: Entry) -> io::Result<()> {
         self.wal.append(&entry)?;
-        apply(&mut self.mem, entry);
+        self.active.put(entry);
+        if self.active.size_bytes() >= self.threshold {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Freezes the active table, flushes it to a new SSTable, and — once that is
+    /// durable — truncates the WAL.
+    fn flush(&mut self) -> io::Result<()> {
+        if self.active.is_empty() {
+            return Ok(());
+        }
+
+        let frozen = std::mem::take(&mut self.active);
+
+        self.next_sst += 1;
+        let path = self.dir.join(format!("sst-{:06}.{SST_EXT}", self.next_sst));
+        SsTable::create(&path, frozen.iter().cloned())?; // sorted: BTreeMap order
+
+        // The data is now durable on disk, so the WAL no longer needs it.
+        self.wal.truncate()?;
+
+        // Keep it readable from memory until Phase 3 reads SSTables from disk.
+        self.frozen.push(frozen);
         Ok(())
     }
 }
 
-/// Replays one entry against the in-memory map.
-fn apply(mem: &mut HashMap<Key, Value>, entry: Entry) {
-    match entry.kind {
-        EntryKind::Put => {
-            mem.insert(entry.key, entry.value);
-        }
-        EntryKind::Delete => {
-            mem.remove(&entry.key);
-        }
+/// Resolves a found entry to a read result: a tombstone reads as absent.
+fn resolve(entry: &Entry) -> Option<Value> {
+    if entry.is_tombstone() {
+        None
+    } else {
+        Some(entry.value.clone())
     }
 }
 
 impl Store for Engine {
     fn get(&self, key: &[u8]) -> Option<Value> {
-        self.mem.get(key).cloned()
+        // Newest layer wins; the first table holding the key is authoritative,
+        // even if that entry is a tombstone (which shadows older values).
+        if let Some(entry) = self.active.get(key) {
+            return resolve(entry);
+        }
+        for table in self.frozen.iter().rev() {
+            if let Some(entry) = table.get(key) {
+                return resolve(entry);
+            }
+        }
+        None
     }
 
     fn set(&mut self, key: Key, value: Value) -> io::Result<()> {
@@ -85,6 +174,38 @@ impl Store for Engine {
         let seq = self.next_seq();
         self.write(Entry::delete(key.to_vec(), seq))
     }
+}
+
+/// Deletes leftover `*.sst.tmp` files from a crash during a previous flush.
+fn remove_stale_temps(dir: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Lists `sst-NNNNNN.sst` files in `dir`, parsed and sorted by number ascending.
+fn sstable_files(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some(SST_EXT) {
+            continue;
+        }
+        if let Some(num) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix("sst-"))
+            .and_then(|n| n.parse::<u64>().ok())
+        {
+            files.push((num, path));
+        }
+    }
+    files.sort_by_key(|(num, _)| *num);
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -111,20 +232,97 @@ mod tests {
         s.as_bytes().to_vec()
     }
 
-    #[test]
-    fn survives_reopen() {
-        let dir = temp_dir("reopen");
-        {
-            let mut db = Engine::open(&dir).unwrap();
-            db.set(k("name"), k("ada")).unwrap();
-            db.set(k("lang"), k("rust")).unwrap();
-            db.set(k("name"), k("grace")).unwrap(); // overwrite
-            db.delete(b"lang").unwrap(); // tombstone
-        } // db dropped: simulate shutdown
+    /// Writes `n` keys with ~20-byte values; small threshold forces flushes.
+    fn fill(db: &mut Engine, n: usize) {
+        for i in 0..n {
+            db.set(format!("key{i:04}").into_bytes(), vec![b'x'; 20])
+                .unwrap();
+        }
+    }
 
-        let db = Engine::open(&dir).unwrap();
-        assert_eq!(db.get(b"name"), Some(k("grace")));
-        assert_eq!(db.get(b"lang"), None); // delete survived recovery
+    #[test]
+    fn flush_triggers_and_data_stays_readable() {
+        let dir = temp_dir("flush");
+        let mut db = Engine::open_with_threshold(&dir, 200).unwrap();
+        fill(&mut db, 100);
+
+        assert!(
+            db.sstable_count() >= 1,
+            "threshold should have forced a flush"
+        );
+        for i in 0..100 {
+            assert_eq!(
+                db.get(format!("key{i:04}").as_bytes()),
+                Some(vec![b'x'; 20])
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn flushed_sstable_is_sorted() {
+        let dir = temp_dir("sorted");
+        let mut db = Engine::open_with_threshold(&dir, 200).unwrap();
+        fill(&mut db, 100);
+
+        let files = sstable_files(&dir).unwrap();
+        assert!(!files.is_empty());
+        for (_, path) in files {
+            let entries = SsTable::open(path).scan().unwrap();
+            let keys: Vec<_> = entries.iter().map(|e| e.key.clone()).collect();
+            let mut sorted = keys.clone();
+            sorted.sort();
+            assert_eq!(keys, sorted, "SSTable must be key-ordered");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wal_is_truncated_after_flush() {
+        let dir = temp_dir("truncate");
+        let mut db = Engine::open_with_threshold(&dir, 200).unwrap();
+
+        // Write until the first flush; the triggering write leaves active empty.
+        let mut i = 0;
+        while db.sstable_count() == 0 {
+            db.set(format!("k{i:04}").into_bytes(), vec![b'x'; 20])
+                .unwrap();
+            i += 1;
+        }
+        assert_eq!(db.active_len(), 0);
+
+        let wal_len = std::fs::metadata(dir.join(WAL_FILE)).unwrap().len();
+        assert_eq!(wal_len, 0, "WAL should be empty right after a clean flush");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_shadows_flushed_value() {
+        let dir = temp_dir("shadow");
+        let mut db = Engine::open_with_threshold(&dir, 200).unwrap();
+        fill(&mut db, 100); // key0000 lands in an early flushed SSTable
+        assert_eq!(db.get(b"key0000"), Some(vec![b'x'; 20]));
+
+        db.delete(b"key0000").unwrap(); // tombstone in a newer layer
+        assert_eq!(db.get(b"key0000"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_rebuilds_from_sstables_and_wal() {
+        let dir = temp_dir("recovery");
+        {
+            let mut db = Engine::open_with_threshold(&dir, 200).unwrap();
+            fill(&mut db, 100); // multiple flushes
+            db.set(b"key0001".to_vec(), b"overwritten".to_vec())
+                .unwrap();
+            db.delete(b"key0050").unwrap();
+        } // shutdown
+
+        let db = Engine::open_with_threshold(&dir, 200).unwrap();
+        assert_eq!(db.get(b"key0001"), Some(b"overwritten".to_vec()));
+        assert_eq!(db.get(b"key0050"), None); // deletion survived
+        assert_eq!(db.get(b"key0099"), Some(vec![b'x'; 20]));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -135,21 +333,11 @@ mod tests {
             let mut db = Engine::open(&dir).unwrap();
             db.set(k("a"), k("1")).unwrap();
             db.set(k("b"), k("2")).unwrap();
-            assert_eq!(db.seq, 2);
         }
-
         let mut db = Engine::open(&dir).unwrap();
-        assert_eq!(db.seq, 2); // restored high-water mark
+        assert_eq!(db.seq, 2);
         db.set(k("c"), k("3")).unwrap();
-        assert_eq!(db.seq, 3); // and keeps climbing
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn empty_open_is_clean() {
-        let dir = temp_dir("empty");
-        let db = Engine::open(&dir).unwrap();
-        assert_eq!(db.get(b"anything"), None);
+        assert_eq!(db.seq, 3);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

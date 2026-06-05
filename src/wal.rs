@@ -51,6 +51,17 @@ impl Wal {
         Ok(())
     }
 
+    /// Empties the log. Called after a flush has made the logged mutations
+    /// durable in an SSTable, so replaying them again would be wasted work. The
+    /// open file handle keeps appending — at offset 0 now.
+    pub fn truncate(&mut self) -> io::Result<()> {
+        self.writer.flush()?;
+        let file = self.writer.get_ref();
+        file.set_len(0)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
     /// Reads every entry in the log at `path`, in write order. A missing file
     /// is an empty log (first start). A torn trailing record is ignored.
     pub fn replay(path: impl AsRef<Path>) -> io::Result<Vec<Entry>> {
@@ -132,6 +143,23 @@ mod tests {
                 Entry::put(b"b".to_vec(), b"2".to_vec(), 3),
             ]
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn truncate_empties_the_log_then_appends_continue() {
+        let path = temp_path("truncate");
+        let mut wal = Wal::open(&path).unwrap();
+        wal.append(&Entry::put(b"a".to_vec(), b"1".to_vec(), 1))
+            .unwrap();
+        wal.truncate().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        // The handle keeps working after truncation.
+        wal.append(&Entry::put(b"b".to_vec(), b"2".to_vec(), 2))
+            .unwrap();
+        let entries = Wal::replay(&path).unwrap();
+        assert_eq!(entries, vec![Entry::put(b"b".to_vec(), b"2".to_vec(), 2)]);
         std::fs::remove_file(&path).ok();
     }
 

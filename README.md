@@ -13,3 +13,8 @@ A persistent, write-optimized key-value store built on a Log-Structured Merge
   mutation to a length-prefixed bincode WAL *before* applying it in memory, and
   replays the log on `open` to rebuild state. Recovery tolerates a torn tail
   record from a crash mid-write; deletes (tombstones) survive recovery.
+- **Phase 2 — MemTable + flush to SSTable:** writes land in a sorted `BTreeMap`
+  MemTable; past a byte threshold it freezes and flushes to an immutable, sorted
+  SSTable (temp-file + atomic rename + fsync), then the WAL is truncated. `delete`
+  now writes a tombstone so it can shadow older on-disk values. Reads check the
+  active table then frozen tables newest→oldest.

@@ -4,13 +4,19 @@
 //! - Phase 0: data model ([`api`]) and an in-memory store ([`store`]).
 //! - Phase 1: durable [`engine::Engine`] backed by a write-ahead log ([`wal`]),
 //!   replayed on startup.
+//! - Phase 2: sorted [`memtable::MemTable`] that flushes to immutable, sorted
+//!   [`sstable::SsTable`] files; the WAL is truncated after each flush.
 
 pub mod api;
 pub mod engine;
+pub mod memtable;
+pub mod sstable;
 pub mod store;
 pub mod wal;
 
 pub use api::{Entry, EntryKind, Key, Request, Response, Value};
 pub use engine::Engine;
+pub use memtable::MemTable;
+pub use sstable::SsTable;
 pub use store::{MemStore, Store};
 pub use wal::Wal;
