@@ -8,20 +8,43 @@
 //! The `Store` interface stays stable across all of that so callers don't change.
 
 use std::collections::HashMap;
+use std::io;
 
 use crate::api::{Key, Request, Response, Value};
 
 /// The operations every storage backend must support.
+///
+/// Mutations return [`io::Result`] because a durable store must persist them
+/// before reporting success (the WAL in [`crate::engine::Engine`] can fail at
+/// the disk). `get` stays infallible while reads are memory-only; it grows a
+/// `Result` in Phase 3 once reads touch on-disk SSTables.
 pub trait Store {
     /// Returns the value for `key`, or `None` if it was never set or has been
     /// deleted.
     fn get(&self, key: &[u8]) -> Option<Value>;
 
     /// Inserts or overwrites `key` with `value`.
-    fn set(&mut self, key: Key, value: Value);
+    fn set(&mut self, key: Key, value: Value) -> io::Result<()>;
 
     /// Removes `key`. A subsequent `get` returns `None`.
-    fn delete(&mut self, key: &[u8]);
+    fn delete(&mut self, key: &[u8]) -> io::Result<()>;
+
+    /// Convenience dispatch over the public command surface, so the
+    /// `Request`/`Response` API types have a real user. Provided once for every
+    /// backend.
+    fn execute(&mut self, req: Request) -> io::Result<Response> {
+        Ok(match req {
+            Request::Get(key) => Response::Value(self.get(&key)),
+            Request::Set(key, value) => {
+                self.set(key, value)?;
+                Response::Ok
+            }
+            Request::Delete(key) => {
+                self.delete(&key)?;
+                Response::Ok
+            }
+        })
+    }
 }
 
 /// In-memory store: a plain key→value map.
@@ -34,22 +57,6 @@ impl MemStore {
     pub fn new() -> Self {
         MemStore::default()
     }
-
-    /// Convenience dispatch over the public command surface, mostly so the
-    /// `Request`/`Response` API types have a real user.
-    pub fn execute(&mut self, req: Request) -> Response {
-        match req {
-            Request::Get(key) => Response::Value(self.get(&key)),
-            Request::Set(key, value) => {
-                self.set(key, value);
-                Response::Ok
-            }
-            Request::Delete(key) => {
-                self.delete(&key);
-                Response::Ok
-            }
-        }
-    }
 }
 
 impl Store for MemStore {
@@ -57,12 +64,14 @@ impl Store for MemStore {
         self.data.get(key).cloned()
     }
 
-    fn set(&mut self, key: Key, value: Value) {
+    fn set(&mut self, key: Key, value: Value) -> io::Result<()> {
         self.data.insert(key, value);
+        Ok(())
     }
 
-    fn delete(&mut self, key: &[u8]) {
+    fn delete(&mut self, key: &[u8]) -> io::Result<()> {
         self.data.remove(key);
+        Ok(())
     }
 }
 
@@ -77,7 +86,7 @@ mod tests {
     #[test]
     fn put_then_get() {
         let mut s = MemStore::new();
-        s.set(k("a"), k("1"));
+        s.set(k("a"), k("1")).unwrap();
         assert_eq!(s.get(b"a"), Some(k("1")));
     }
 
@@ -90,44 +99,50 @@ mod tests {
     #[test]
     fn overwrite_keeps_newest() {
         let mut s = MemStore::new();
-        s.set(k("a"), k("1"));
-        s.set(k("a"), k("2"));
+        s.set(k("a"), k("1")).unwrap();
+        s.set(k("a"), k("2")).unwrap();
         assert_eq!(s.get(b"a"), Some(k("2")));
     }
 
     #[test]
     fn delete_hides_value() {
         let mut s = MemStore::new();
-        s.set(k("a"), k("1"));
-        s.delete(b"a");
+        s.set(k("a"), k("1")).unwrap();
+        s.delete(b"a").unwrap();
         assert_eq!(s.get(b"a"), None);
     }
 
     #[test]
     fn delete_missing_is_noop() {
         let mut s = MemStore::new();
-        s.delete(b"ghost");
+        s.delete(b"ghost").unwrap();
         assert_eq!(s.get(b"ghost"), None);
     }
 
     #[test]
     fn delete_then_reput() {
         let mut s = MemStore::new();
-        s.set(k("a"), k("1"));
-        s.delete(b"a");
-        s.set(k("a"), k("2"));
+        s.set(k("a"), k("1")).unwrap();
+        s.delete(b"a").unwrap();
+        s.set(k("a"), k("2")).unwrap();
         assert_eq!(s.get(b"a"), Some(k("2")));
     }
 
     #[test]
     fn execute_dispatches_requests() {
         let mut s = MemStore::new();
-        assert_eq!(s.execute(Request::Set(k("a"), k("1"))), Response::Ok);
         assert_eq!(
-            s.execute(Request::Get(k("a"))),
+            s.execute(Request::Set(k("a"), k("1"))).unwrap(),
+            Response::Ok
+        );
+        assert_eq!(
+            s.execute(Request::Get(k("a"))).unwrap(),
             Response::Value(Some(k("1")))
         );
-        assert_eq!(s.execute(Request::Delete(k("a"))), Response::Ok);
-        assert_eq!(s.execute(Request::Get(k("a"))), Response::Value(None));
+        assert_eq!(s.execute(Request::Delete(k("a"))).unwrap(), Response::Ok);
+        assert_eq!(
+            s.execute(Request::Get(k("a"))).unwrap(),
+            Response::Value(None)
+        );
     }
 }
