@@ -24,3 +24,7 @@ A persistent, write-optimized key-value store built on a Log-Structured Merge
   MemTables are dropped, reclaiming memory. `get` is now `io::Result` and the read
   order is active MemTable → SSTables newest→oldest, honoring tombstones. Recovery
   restores the sequence counter from the footer without rescanning data.
+- **Phase 4 — Bloom filters:** each SSTable carries a persisted Bloom filter
+  (FNV-1a double hashing, ~1% false-positive rate) checked before the index, so a
+  Get for an absent key skips the table with no disk read — and never a false
+  negative. The engine tracks the skip rate (`bloom_skip_rate()`).

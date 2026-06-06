@@ -12,12 +12,23 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::api::{Entry, Key, Value};
 use crate::memtable::MemTable;
 use crate::sstable::SsTable;
 use crate::store::Store;
 use crate::wal::Wal;
+
+/// Counters for how often the Bloom filter spared us an SSTable lookup. Atomic
+/// so they update behind a shared `&self` read path.
+#[derive(Default)]
+struct BloomStats {
+    /// Times an SSTable was considered for a `get`.
+    probes: AtomicU64,
+    /// Of those, times the Bloom filter rejected the key (no block read).
+    skips: AtomicU64,
+}
 
 const WAL_FILE: &str = "wal.log";
 const SST_EXT: &str = "sst";
@@ -38,6 +49,8 @@ pub struct Engine {
     next_sst: u64,
     /// Flush when the active table reaches this many bytes.
     threshold: usize,
+    /// Bloom-filter effectiveness counters.
+    bloom_stats: BloomStats,
 }
 
 impl Engine {
@@ -82,6 +95,7 @@ impl Engine {
             seq,
             next_sst,
             threshold,
+            bloom_stats: BloomStats::default(),
         })
     }
 
@@ -97,6 +111,16 @@ impl Engine {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Fraction of SSTable probes that the Bloom filter let us skip without a
+    /// disk read, over the engine's lifetime. `0.0` if nothing has been probed.
+    pub fn bloom_skip_rate(&self) -> f64 {
+        let probes = self.bloom_stats.probes.load(Ordering::Relaxed);
+        if probes == 0 {
+            return 0.0;
+        }
+        self.bloom_stats.skips.load(Ordering::Relaxed) as f64 / probes as f64
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -155,6 +179,12 @@ impl Store for Engine {
             return Ok(resolve(entry));
         }
         for sst in self.sstables.iter().rev() {
+            self.bloom_stats.probes.fetch_add(1, Ordering::Relaxed);
+            if !sst.may_contain(key) {
+                // Definitely absent: skip the index search and block read.
+                self.bloom_stats.skips.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             if let Some(entry) = sst.get(key)? {
                 return Ok(resolve(&entry));
             }
@@ -320,6 +350,34 @@ mod tests {
         assert_eq!(db.get(b"key0001").unwrap(), Some(b"overwritten".to_vec()));
         assert_eq!(db.get(b"key0050").unwrap(), None); // deletion survived
         assert_eq!(db.get(b"key0099").unwrap(), Some(vec![b'x'; 20]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bloom_filter_skips_absent_keys() {
+        let dir = temp_dir("bloom");
+        let mut db = Engine::open_with_threshold(&dir, 256).unwrap();
+        fill(&mut db, 300); // many SSTables on disk
+
+        assert!(db.sstable_count() > 3);
+
+        // Look up keys that exist in no table at all.
+        for i in 0..300 {
+            assert_eq!(db.get(format!("absent{i:04}").as_bytes()).unwrap(), None);
+        }
+
+        // Almost every SSTable probe should have been skipped by the filter
+        // (only the ~1% false-positive probes fall through to a real lookup).
+        let rate = db.bloom_skip_rate();
+        assert!(rate > 0.9, "bloom skip rate too low: {rate}");
+
+        // And present keys are still always found (no false negatives).
+        for i in 0..300 {
+            assert_eq!(
+                db.get(format!("key{i:04}").as_bytes()).unwrap(),
+                Some(vec![b'x'; 20])
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

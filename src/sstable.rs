@@ -6,12 +6,16 @@
 //! ```text
 //! [ data:   record* ]                      each: [u32 len][bincode(Entry)], keys ascending
 //! [ index:  bincode(Vec<(Key, u64 offset)>) ]   one entry per Nth data record
-//! [ footer: u64 index_offset | u64 index_len | u64 max_seq | u64 magic ]
+//! [ bloom:  bincode(Bloom) ]                     membership filter over all keys
+//! [ footer: u64 index_offset | u64 index_len | u64 bloom_offset | u64 bloom_len
+//!           | u64 max_seq | u64 magic ]
 //! ```
 //!
-//! Lookup: binary-search the (small, in-memory) index for the largest indexed
-//! key ≤ target to get a starting offset, then scan forward at most `INDEX_INTERVAL`
-//! records — keys are sorted, so we stop as soon as we meet or pass the target.
+//! Lookup: a Bloom filter check first rejects keys that are definitely absent
+//! with no disk read; otherwise binary-search the (small, in-memory) index for
+//! the largest indexed key ≤ target to get a starting offset, then scan forward
+//! at most `INDEX_INTERVAL` records — keys are sorted, so we stop as soon as we
+//! meet or pass the target.
 //!
 //! Writes are crash-safe: a temp file is fsynced and atomically renamed into
 //! place, so a reader never sees a half-written SSTable.
@@ -22,26 +26,33 @@ use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write
 use std::path::{Path, PathBuf};
 
 use crate::api::{Entry, Key};
+use crate::bloom::Bloom;
 
 /// One index entry every this many data records. Smaller = bigger index but
 /// shorter scans; 16 is a reasonable middle for now (tunable later).
 const INDEX_INTERVAL: usize = 16;
 
-/// Fixed-size footer: index_offset, index_len, max_seq, magic — four u64s.
-const FOOTER_SIZE: u64 = 32;
+/// Target false-positive rate for each table's Bloom filter.
+const BLOOM_FP_RATE: f64 = 0.01;
+
+/// Fixed-size footer: index_offset, index_len, bloom_offset, bloom_len,
+/// max_seq, magic — six u64s.
+const FOOTER_SIZE: u64 = 48;
 
 /// Identifies the file format (and version) in the footer.
-const MAGIC: u64 = 0x5354_5241_5441_0003;
+const MAGIC: u64 = 0x5354_5241_5441_0004;
 
 fn invalid(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, e.to_string())
 }
 
-/// An open SSTable: a path plus its loaded sparse index.
+/// An open SSTable: a path plus its loaded sparse index and Bloom filter.
 pub struct SsTable {
     path: PathBuf,
     /// `(key, byte offset)` for every `INDEX_INTERVAL`-th record. Ascending.
     index: Vec<(Key, u64)>,
+    /// Membership filter over every key in the table — checked before any read.
+    bloom: Bloom,
     /// Byte offset where the data section ends (and the index begins).
     data_end: u64,
     /// Largest sequence number stored, for cheap seq recovery without scanning.
@@ -59,20 +70,26 @@ impl SsTable {
         let mut tmp = path.clone();
         tmp.set_extension("sst.tmp");
 
+        // Buffer the entries so we know the key count up front (to size the
+        // Bloom filter). The set is bounded by the MemTable flush threshold.
+        let entries: Vec<Entry> = entries.into_iter().collect();
+
         {
             let file = File::create(&tmp)?;
             let mut writer = BufWriter::new(file);
             let mut index: Vec<(Key, u64)> = Vec::new();
+            let key_refs: Vec<&[u8]> = entries.iter().map(|e| e.key.as_slice()).collect();
+            let bloom = Bloom::build(&key_refs, BLOOM_FP_RATE);
             let mut offset: u64 = 0;
             let mut max_seq: u64 = 0;
 
-            for (i, entry) in entries.into_iter().enumerate() {
+            for (i, entry) in entries.iter().enumerate() {
                 if i % INDEX_INTERVAL == 0 {
                     index.push((entry.key.clone(), offset));
                 }
                 max_seq = max_seq.max(entry.seq);
 
-                let bytes = bincode::serialize(&entry).map_err(invalid)?;
+                let bytes = bincode::serialize(entry).map_err(invalid)?;
                 let len = u32::try_from(bytes.len()).map_err(invalid)?;
                 writer.write_all(&len.to_le_bytes())?;
                 writer.write_all(&bytes)?;
@@ -84,8 +101,15 @@ impl SsTable {
             let index_len = index_bytes.len() as u64;
             writer.write_all(&index_bytes)?;
 
+            let bloom_offset = index_offset + index_len;
+            let bloom_bytes = bincode::serialize(&bloom).map_err(invalid)?;
+            let bloom_len = bloom_bytes.len() as u64;
+            writer.write_all(&bloom_bytes)?;
+
             writer.write_all(&index_offset.to_le_bytes())?;
             writer.write_all(&index_len.to_le_bytes())?;
+            writer.write_all(&bloom_offset.to_le_bytes())?;
+            writer.write_all(&bloom_len.to_le_bytes())?;
             writer.write_all(&max_seq.to_le_bytes())?;
             writer.write_all(&MAGIC.to_le_bytes())?;
 
@@ -113,8 +137,10 @@ impl SsTable {
         file.read_exact(&mut footer)?;
         let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
         let index_len = u64::from_le_bytes(footer[8..16].try_into().unwrap());
-        let max_seq = u64::from_le_bytes(footer[16..24].try_into().unwrap());
-        let magic = u64::from_le_bytes(footer[24..32].try_into().unwrap());
+        let bloom_offset = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+        let bloom_len = u64::from_le_bytes(footer[24..32].try_into().unwrap());
+        let max_seq = u64::from_le_bytes(footer[32..40].try_into().unwrap());
+        let magic = u64::from_le_bytes(footer[40..48].try_into().unwrap());
         if magic != MAGIC {
             return Err(invalid("bad sstable magic"));
         }
@@ -124,9 +150,15 @@ impl SsTable {
         file.read_exact(&mut index_bytes)?;
         let index = bincode::deserialize(&index_bytes).map_err(invalid)?;
 
+        file.seek(SeekFrom::Start(bloom_offset))?;
+        let mut bloom_bytes = vec![0u8; bloom_len as usize];
+        file.read_exact(&mut bloom_bytes)?;
+        let bloom = bincode::deserialize(&bloom_bytes).map_err(invalid)?;
+
         Ok(SsTable {
             path,
             index,
+            bloom,
             data_end: index_offset,
             max_seq,
         })
@@ -141,9 +173,19 @@ impl SsTable {
         self.max_seq
     }
 
+    /// `false` means `key` is definitely not in this table (no disk read needed).
+    /// `true` means it might be — the caller should `get` to be sure.
+    pub fn may_contain(&self, key: &[u8]) -> bool {
+        self.bloom.contains(key)
+    }
+
     /// Point lookup. Returns the stored entry (tombstone or value) for `key`, or
-    /// `None` if this table doesn't contain it. Reads at most one block.
+    /// `None` if this table doesn't contain it. Reads at most one block, and
+    /// none at all when the Bloom filter rejects the key.
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Entry>> {
+        if !self.bloom.contains(key) {
+            return Ok(None);
+        }
         let start = match self.index.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
             Ok(i) => self.index[i].1,      // target is an indexed key
             Err(0) => return Ok(None),     // target precedes the first key

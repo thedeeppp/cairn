@@ -6,8 +6,12 @@
 //!   replayed on startup.
 //! - Phase 2: sorted [`memtable::MemTable`] that flushes to immutable, sorted
 //!   [`sstable::SsTable`] files; the WAL is truncated after each flush.
+//! - Phase 3: SSTable read path — sparse index + footer, reads from disk.
+//! - Phase 4: a per-SSTable [`bloom::Bloom`] filter skips tables that can't hold
+//!   a key, with no disk read.
 
 pub mod api;
+pub mod bloom;
 pub mod engine;
 pub mod memtable;
 pub mod sstable;
@@ -15,6 +19,7 @@ pub mod store;
 pub mod wal;
 
 pub use api::{Entry, EntryKind, Key, Request, Response, Value};
+pub use bloom::Bloom;
 pub use engine::Engine;
 pub use memtable::MemTable;
 pub use sstable::SsTable;
