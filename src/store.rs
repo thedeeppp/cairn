@@ -14,14 +14,13 @@ use crate::api::{Key, Request, Response, Value};
 
 /// The operations every storage backend must support.
 ///
-/// Mutations return [`io::Result`] because a durable store must persist them
-/// before reporting success (the WAL in [`crate::engine::Engine`] can fail at
-/// the disk). `get` stays infallible while reads are memory-only; it grows a
-/// `Result` in Phase 3 once reads touch on-disk SSTables.
+/// All three return [`io::Result`] because a durable store touches the disk:
+/// mutations must persist before reporting success, and as of Phase 3 a `get`
+/// may have to read on-disk SSTables.
 pub trait Store {
     /// Returns the value for `key`, or `None` if it was never set or has been
     /// deleted.
-    fn get(&self, key: &[u8]) -> Option<Value>;
+    fn get(&self, key: &[u8]) -> io::Result<Option<Value>>;
 
     /// Inserts or overwrites `key` with `value`.
     fn set(&mut self, key: Key, value: Value) -> io::Result<()>;
@@ -34,7 +33,7 @@ pub trait Store {
     /// backend.
     fn execute(&mut self, req: Request) -> io::Result<Response> {
         Ok(match req {
-            Request::Get(key) => Response::Value(self.get(&key)),
+            Request::Get(key) => Response::Value(self.get(&key)?),
             Request::Set(key, value) => {
                 self.set(key, value)?;
                 Response::Ok
@@ -60,8 +59,8 @@ impl MemStore {
 }
 
 impl Store for MemStore {
-    fn get(&self, key: &[u8]) -> Option<Value> {
-        self.data.get(key).cloned()
+    fn get(&self, key: &[u8]) -> io::Result<Option<Value>> {
+        Ok(self.data.get(key).cloned())
     }
 
     fn set(&mut self, key: Key, value: Value) -> io::Result<()> {
@@ -87,13 +86,13 @@ mod tests {
     fn put_then_get() {
         let mut s = MemStore::new();
         s.set(k("a"), k("1")).unwrap();
-        assert_eq!(s.get(b"a"), Some(k("1")));
+        assert_eq!(s.get(b"a").unwrap(), Some(k("1")));
     }
 
     #[test]
     fn get_missing_is_none() {
         let s = MemStore::new();
-        assert_eq!(s.get(b"nope"), None);
+        assert_eq!(s.get(b"nope").unwrap(), None);
     }
 
     #[test]
@@ -101,7 +100,7 @@ mod tests {
         let mut s = MemStore::new();
         s.set(k("a"), k("1")).unwrap();
         s.set(k("a"), k("2")).unwrap();
-        assert_eq!(s.get(b"a"), Some(k("2")));
+        assert_eq!(s.get(b"a").unwrap(), Some(k("2")));
     }
 
     #[test]
@@ -109,14 +108,14 @@ mod tests {
         let mut s = MemStore::new();
         s.set(k("a"), k("1")).unwrap();
         s.delete(b"a").unwrap();
-        assert_eq!(s.get(b"a"), None);
+        assert_eq!(s.get(b"a").unwrap(), None);
     }
 
     #[test]
     fn delete_missing_is_noop() {
         let mut s = MemStore::new();
         s.delete(b"ghost").unwrap();
-        assert_eq!(s.get(b"ghost"), None);
+        assert_eq!(s.get(b"ghost").unwrap(), None);
     }
 
     #[test]
@@ -125,7 +124,7 @@ mod tests {
         s.set(k("a"), k("1")).unwrap();
         s.delete(b"a").unwrap();
         s.set(k("a"), k("2")).unwrap();
-        assert_eq!(s.get(b"a"), Some(k("2")));
+        assert_eq!(s.get(b"a").unwrap(), Some(k("2")));
     }
 
     #[test]

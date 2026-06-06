@@ -45,17 +45,17 @@ fn flushes_then_reopen_preserve_everything() {
 
     // Reopen purely from SSTables + WAL.
     let db = Engine::open_with_threshold(&dir, 1024).unwrap();
-    assert_eq!(db.get(b"k00000"), Some(b"NEW".to_vec())); // overwrite survived
-    assert_eq!(db.get(b"k00042"), None); // delete survived
-    assert_eq!(db.get(b"k00500"), Some(b"value-00500".to_vec()));
-    assert_eq!(db.get(b"k00999"), Some(b"value-00999".to_vec()));
-    assert_eq!(db.get(b"missing"), None);
+    assert_eq!(db.get(b"k00000").unwrap(), Some(b"NEW".to_vec())); // overwrite survived
+    assert_eq!(db.get(b"k00042").unwrap(), None); // delete survived
+    assert_eq!(db.get(b"k00500").unwrap(), Some(b"value-00500".to_vec()));
+    assert_eq!(db.get(b"k00999").unwrap(), Some(b"value-00999".to_vec()));
+    assert_eq!(db.get(b"missing").unwrap(), None);
 
     // Every SSTable on disk is independently key-sorted.
     for entry in std::fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().and_then(|e| e.to_str()) == Some("sst") {
-            let entries = SsTable::open(path).scan().unwrap();
+            let entries = SsTable::open(path).unwrap().scan().unwrap();
             let keys: Vec<_> = entries.iter().map(|e| e.key.clone()).collect();
             let mut sorted = keys.clone();
             sorted.sort();

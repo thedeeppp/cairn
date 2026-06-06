@@ -18,3 +18,9 @@ A persistent, write-optimized key-value store built on a Log-Structured Merge
   SSTable (temp-file + atomic rename + fsync), then the WAL is truncated. `delete`
   now writes a tombstone so it can shadow older on-disk values. Reads check the
   active table then frozen tables newest→oldest.
+- **Phase 3 — SSTable read path:** SSTables gain a sparse index (offset of every
+  16th key) + a footer (index location, max-seq, magic). Reads `get` from disk by
+  binary-searching the in-memory index and scanning a single block; flushed
+  MemTables are dropped, reclaiming memory. `get` is now `io::Result` and the read
+  order is active MemTable → SSTables newest→oldest, honoring tombstones. Recovery
+  restores the sequence counter from the footer without rescanning data.

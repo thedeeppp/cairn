@@ -13,7 +13,7 @@ fn main() -> std::io::Result<()> {
 
     // Reopen from the WAL alone.
     let db = Engine::open(&dir)?;
-    match db.get(b"hello") {
+    match db.get(b"hello")? {
         Some(v) => println!("recovered hello = {}", String::from_utf8_lossy(&v)),
         None => println!("hello is absent"),
     }

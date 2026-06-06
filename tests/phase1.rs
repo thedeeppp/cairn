@@ -43,12 +43,12 @@ fn data_survives_drop_and_reopen() {
 
     let db = Engine::open(&dir).unwrap();
 
-    assert_eq!(db.get(b"key0"), Some(b"overwritten".to_vec())); // overwrite kept
-    assert_eq!(db.get(b"key1"), Some(b"val1".to_vec()));
-    assert_eq!(db.get(b"key50"), None); // delete kept
-    assert_eq!(db.get(b"key99"), None); // delete kept
-    assert_eq!(db.get(b"key98"), Some(b"val98".to_vec()));
-    assert_eq!(db.get(b"missing"), None);
+    assert_eq!(db.get(b"key0").unwrap(), Some(b"overwritten".to_vec())); // overwrite kept
+    assert_eq!(db.get(b"key1").unwrap(), Some(b"val1".to_vec()));
+    assert_eq!(db.get(b"key50").unwrap(), None); // delete kept
+    assert_eq!(db.get(b"key99").unwrap(), None); // delete kept
+    assert_eq!(db.get(b"key98").unwrap(), Some(b"val98".to_vec()));
+    assert_eq!(db.get(b"missing").unwrap(), None);
 
     std::fs::remove_dir_all(&dir).ok();
 }
