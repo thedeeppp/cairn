@@ -8,8 +8,11 @@
 //! [ index:  bincode(Vec<(Key, u64 offset)>) ]   one entry per Nth data record
 //! [ bloom:  bincode(Bloom) ]                     membership filter over all keys
 //! [ footer: u64 index_offset | u64 index_len | u64 bloom_offset | u64 bloom_len
-//!           | u64 max_seq | u64 magic ]
+//!           | u64 max_seq | u64 kind | u64 magic ]
 //! ```
+//!
+//! `kind` is 1 for a compaction output (which supersedes every lower-numbered
+//! table) and 0 for an ordinary flush — see `Engine`'s recovery cleanup.
 //!
 //! Lookup: a Bloom filter check first rejects keys that are definitely absent
 //! with no disk read; otherwise binary-search the (small, in-memory) index for
@@ -36,11 +39,11 @@ const INDEX_INTERVAL: usize = 16;
 const BLOOM_FP_RATE: f64 = 0.01;
 
 /// Fixed-size footer: index_offset, index_len, bloom_offset, bloom_len,
-/// max_seq, magic — six u64s.
-const FOOTER_SIZE: u64 = 48;
+/// max_seq, kind, magic — seven u64s.
+const FOOTER_SIZE: u64 = 56;
 
 /// Identifies the file format (and version) in the footer.
-const MAGIC: u64 = 0x5354_5241_5441_0004;
+const MAGIC: u64 = 0x5354_5241_5441_0005;
 
 fn invalid(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, e.to_string())
@@ -57,14 +60,35 @@ pub struct SsTable {
     data_end: u64,
     /// Largest sequence number stored, for cheap seq recovery without scanning.
     max_seq: u64,
+    /// True if this table is a compaction output that supersedes every
+    /// lower-numbered table (see `Engine::open`'s recovery cleanup).
+    compaction: bool,
 }
 
 impl SsTable {
-    /// Writes `entries` (which **must** be in ascending key order) to a new
-    /// SSTable at `path`, durably, and returns it opened (index loaded).
+    /// Writes a flush output: `entries` (which **must** be in ascending key
+    /// order) to a new SSTable at `path`, durably, returned opened.
     pub fn create(
         path: impl AsRef<Path>,
         entries: impl IntoIterator<Item = Entry>,
+    ) -> io::Result<SsTable> {
+        Self::write(path, entries, false)
+    }
+
+    /// Like [`SsTable::create`], but marks the table as a compaction output that
+    /// supersedes every lower-numbered table — letting recovery delete leftover
+    /// inputs from a crash that struck mid-compaction.
+    pub fn create_compaction(
+        path: impl AsRef<Path>,
+        entries: impl IntoIterator<Item = Entry>,
+    ) -> io::Result<SsTable> {
+        Self::write(path, entries, true)
+    }
+
+    fn write(
+        path: impl AsRef<Path>,
+        entries: impl IntoIterator<Item = Entry>,
+        compaction: bool,
     ) -> io::Result<SsTable> {
         let path = path.as_ref().to_path_buf();
         let mut tmp = path.clone();
@@ -111,6 +135,7 @@ impl SsTable {
             writer.write_all(&bloom_offset.to_le_bytes())?;
             writer.write_all(&bloom_len.to_le_bytes())?;
             writer.write_all(&max_seq.to_le_bytes())?;
+            writer.write_all(&(compaction as u64).to_le_bytes())?;
             writer.write_all(&MAGIC.to_le_bytes())?;
 
             writer.flush()?;
@@ -140,7 +165,8 @@ impl SsTable {
         let bloom_offset = u64::from_le_bytes(footer[16..24].try_into().unwrap());
         let bloom_len = u64::from_le_bytes(footer[24..32].try_into().unwrap());
         let max_seq = u64::from_le_bytes(footer[32..40].try_into().unwrap());
-        let magic = u64::from_le_bytes(footer[40..48].try_into().unwrap());
+        let kind = u64::from_le_bytes(footer[40..48].try_into().unwrap());
+        let magic = u64::from_le_bytes(footer[48..56].try_into().unwrap());
         if magic != MAGIC {
             return Err(invalid("bad sstable magic"));
         }
@@ -161,6 +187,7 @@ impl SsTable {
             bloom,
             data_end: index_offset,
             max_seq,
+            compaction: kind == 1,
         })
     }
 
@@ -171,6 +198,12 @@ impl SsTable {
     /// Largest sequence number stored in this table.
     pub fn max_seq(&self) -> u64 {
         self.max_seq
+    }
+
+    /// True if this table is a compaction output (it supersedes every
+    /// lower-numbered table on disk).
+    pub fn is_compaction(&self) -> bool {
+        self.compaction
     }
 
     /// `false` means `key` is definitely not in this table (no disk read needed).
@@ -330,6 +363,23 @@ mod tests {
         // Survives a fresh open (read from footer, not recomputed).
         assert_eq!(SsTable::open(&path).unwrap().max_seq(), 42);
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn compaction_flag_persists() {
+        let path = temp_path("kind");
+        // A plain flush is not a compaction output.
+        SsTable::create(&path, vec![put("a", "1", 1)]).unwrap();
+        assert!(!SsTable::open(&path).unwrap().is_compaction());
+
+        // A compaction output is flagged, and the flag survives a reopen.
+        let comp = temp_path("kind2");
+        let sst = SsTable::create_compaction(&comp, vec![put("a", "1", 1)]).unwrap();
+        assert!(sst.is_compaction());
+        assert!(SsTable::open(&comp).unwrap().is_compaction());
+
+        fs::remove_file(&path).ok();
+        fs::remove_file(&comp).ok();
     }
 
     #[test]

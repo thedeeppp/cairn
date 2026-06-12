@@ -28,3 +28,9 @@ A persistent, write-optimized key-value store built on a Log-Structured Merge
   (FNV-1a double hashing, ~1% false-positive rate) checked before the index, so a
   Get for an absent key skips the table with no disk read — and never a false
   negative. The engine tracks the skip rate (`bloom_skip_rate()`).
+- **Phase 5 — Size-tiered compaction:** once enough SSTables pile up, a
+  background thread merges them all into one, keeping the newest value per key
+  and dropping tombstones — collapsing overwrites and deletions to reclaim disk
+  space. The merged table is flagged *superseding* in its footer, so recovery
+  deletes any lower-numbered input a crash left behind, ensuring a dropped
+  tombstone can never resurrect a deleted key.

@@ -9,9 +9,12 @@
 //! - Phase 3: SSTable read path — sparse index + footer, reads from disk.
 //! - Phase 4: a per-SSTable [`bloom::Bloom`] filter skips tables that can't hold
 //!   a key, with no disk read.
+//! - Phase 5: background size-tiered [`compaction`] merges SSTables, collapsing
+//!   to the newest value per key and dropping tombstones (crash-safely).
 
 pub mod api;
 pub mod bloom;
+pub mod compaction;
 pub mod engine;
 pub mod memtable;
 pub mod sstable;
