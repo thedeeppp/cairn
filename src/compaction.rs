@@ -3,10 +3,14 @@
 //!
 //! The merge is the pure part of compaction; the [`engine`](crate::engine) runs
 //! it on a background thread and atomically swaps the result in for its inputs.
+//! The inputs are scanned in parallel with rayon, since the heavy cost is the
+//! per-table disk reads and bincode decoding, which are independent.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
+
+use rayon::prelude::*;
 
 use crate::api::{Entry, Key};
 use crate::sstable::SsTable;
@@ -20,10 +24,18 @@ use crate::sstable::SsTable;
 /// guarantees this by compacting *every* table at once and flagging the output
 /// as superseding, so a crash mid-swap can't resurrect a dropped key.
 pub fn merge_tables(tables: &[Arc<SsTable>], drop_tombstones: bool) -> io::Result<Vec<Entry>> {
-    // BTreeMap keeps the result key-ordered, ready to hand to `SsTable::create`.
+    // Scan every input in parallel; the reads and decoding are independent. If
+    // any scan fails, the whole merge fails.
+    let runs: Vec<Vec<Entry>> = tables
+        .par_iter()
+        .map(|table| table.scan())
+        .collect::<io::Result<Vec<_>>>()?;
+
+    // Collapse to the newest version of each key. BTreeMap keeps the result
+    // key-ordered, ready to hand to `SsTable::create`.
     let mut newest: BTreeMap<Key, Entry> = BTreeMap::new();
-    for table in tables {
-        for entry in table.scan()? {
+    for run in runs {
+        for entry in run {
             match newest.get(&entry.key) {
                 // Keep whichever version is newer.
                 Some(existing) if existing.seq >= entry.seq => {}

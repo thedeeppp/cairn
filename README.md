@@ -9,7 +9,7 @@ A persistent, write-optimized key-value store built on a Log-Structured Merge
   and a `HashMap`-backed in-memory `Store` (get/set/delete), where `delete`
   simply removes the key. Tombstones/sequence numbers arrive in later phases
   where they're load-bearing (WAL, SSTables).
-- **Phase 1 — Write-ahead log + recovery:** durable `Engine` that fsyncs every
+- **Phase 1 — Write-ahead log + recovery:** durable `Engine` that fsyncs everyg
   mutation to a length-prefixed bincode WAL *before* applying it in memory, and
   replays the log on `open` to rebuild state. Recovery tolerates a torn tail
   record from a crash mid-write; deletes (tombstones) survive recovery.
@@ -34,3 +34,8 @@ A persistent, write-optimized key-value store built on a Log-Structured Merge
   space. The merged table is flagged *superseding* in its footer, so recovery
   deletes any lower-numbered input a crash left behind, ensuring a dropped
   tombstone can never resurrect a deleted key.
+- **Phase 6 — Parallelism + benchmarks:** compaction now scans its input
+  SSTables in parallel with rayon (the per-table disk reads and bincode decoding
+  are independent), then merges newest-seq-wins. A hand-rolled `cargo bench`
+  target (`benches/engine_bench.rs`, no criterion) reports write, read
+  (present/absent), and compaction throughput and latency.

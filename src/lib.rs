@@ -11,6 +11,8 @@
 //!   a key, with no disk read.
 //! - Phase 5: background size-tiered [`compaction`] merges SSTables, collapsing
 //!   to the newest value per key and dropping tombstones (crash-safely).
+//! - Phase 6: compaction scans its inputs in parallel with rayon; a hand-rolled
+//!   `cargo bench` target reports write/read/compaction throughput.
 
 pub mod api;
 pub mod bloom;
