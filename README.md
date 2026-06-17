@@ -16,9 +16,9 @@ filters, compaction) actually implemented rather than hand-waved.
 ```rust
 use cairn::{Engine, Store};
 
-let mut db = Engine::open("/var/lib/mydb")?;   // creates dir + recovers if present
+let mut db = Engine::open("/var/lib/mydb")?;  
 
-db.set(b"user:42".to_vec(), b"alice".to_vec())?;  // durable before it returns
+db.set(b"user:42".to_vec(), b"alice".to_vec())?;  
 assert_eq!(db.get(b"user:42")?, Some(b"alice".to_vec()));
 
 db.delete(b"user:42")?;                            // writes a tombstone
@@ -217,40 +217,3 @@ cargo clippy --all-targets -- -D warnings
 cargo bench                             # throughput / latency report
 cargo run                               # tiny smoke-test binary (write, reopen, read)
 ```
-
-## Changelog
-
-- **Phase 0 — Bootstrap:** data model (`Entry`, `EntryKind`, `Request`/`Response`)
-  and a `HashMap`-backed in-memory `Store` (get/set/delete), where `delete`
-  simply removes the key. Tombstones/sequence numbers arrive in later phases
-  where they're load-bearing (WAL, SSTables).
-- **Phase 1 — Write-ahead log + recovery:** durable `Engine` that fsyncs everyg
-  mutation to a length-prefixed bincode WAL *before* applying it in memory, and
-  replays the log on `open` to rebuild state. Recovery tolerates a torn tail
-  record from a crash mid-write; deletes (tombstones) survive recovery.
-- **Phase 2 — MemTable + flush to SSTable:** writes land in a sorted `BTreeMap`
-  MemTable; past a byte threshold it freezes and flushes to an immutable, sorted
-  SSTable (temp-file + atomic rename + fsync), then the WAL is truncated. `delete`
-  now writes a tombstone so it can shadow older on-disk values. Reads check the
-  active table then frozen tables newest→oldest.
-- **Phase 3 — SSTable read path:** SSTables gain a sparse index (offset of every
-  16th key) + a footer (index location, max-seq, magic). Reads `get` from disk by
-  binary-searching the in-memory index and scanning a single block; flushed
-  MemTables are dropped, reclaiming memory. `get` is now `io::Result` and the read
-  order is active MemTable → SSTables newest→oldest, honoring tombstones. Recovery
-  restores the sequence counter from the footer without rescanning data.
-- **Phase 4 — Bloom filters:** each SSTable carries a persisted Bloom filter
-  (FNV-1a double hashing, ~1% false-positive rate) checked before the index, so a
-  Get for an absent key skips the table with no disk read — and never a false
-  negative. The engine tracks the skip rate (`bloom_skip_rate()`).
-- **Phase 5 — Size-tiered compaction:** once enough SSTables pile up, a
-  background thread merges them all into one, keeping the newest value per key
-  and dropping tombstones — collapsing overwrites and deletions to reclaim disk
-  space. The merged table is flagged *superseding* in its footer, so recovery
-  deletes any lower-numbered input a crash left behind, ensuring a dropped
-  tombstone can never resurrect a deleted key.
-- **Phase 6 — Parallelism + benchmarks:** compaction now scans its input
-  SSTables in parallel with rayon (the per-table disk reads and bincode decoding
-  are independent), then merges newest-seq-wins. A hand-rolled `cargo bench`
-  target (`benches/engine_bench.rs`, no criterion) reports write, read
-  (present/absent), and compaction throughput and latency.
