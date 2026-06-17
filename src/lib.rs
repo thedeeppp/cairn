@@ -1,4 +1,4 @@
-//! Strata — a write-optimized, persistent key-value store built on an
+//! Cairn — a write-optimized, persistent key-value store built on an
 //! LSM-tree. Built strictly phase by phase; see `CLAUDE.md`.
 //!
 //! - Phase 0: data model ([`api`]) and an in-memory store ([`store`]).

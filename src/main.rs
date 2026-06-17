@@ -1,10 +1,10 @@
 //! Tiny smoke-test binary. The real interface is the library crate; this just
 //! proves the durable engine wires together and survives a reopen.
 
-use strata::{Engine, Store};
+use cairn::{Engine, Store};
 
 fn main() -> std::io::Result<()> {
-    let dir = std::env::temp_dir().join("strata-demo");
+    let dir = std::env::temp_dir().join("cairn-demo");
 
     {
         let mut db = Engine::open(&dir)?;

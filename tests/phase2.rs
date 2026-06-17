@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use strata::{Engine, SsTable, Store};
+use cairn::{Engine, SsTable, Store};
 
 fn temp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -13,7 +13,7 @@ fn temp_dir(tag: &str) -> PathBuf {
         .as_nanos();
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "strata-it2-{}-{}-{}",
+        "cairn-it2-{}-{}-{}",
         tag,
         std::process::id(),
         nanos

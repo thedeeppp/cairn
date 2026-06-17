@@ -1,7 +1,7 @@
 //! Phase 0 integration test: drive the public store through a realistic
 //! sequence of operations from outside the crate.
 
-use strata::{MemStore, Store};
+use cairn::{MemStore, Store};
 
 #[test]
 fn put_overwrite_delete_lifecycle() {

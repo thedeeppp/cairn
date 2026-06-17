@@ -114,7 +114,7 @@ mod tests {
             .as_nanos();
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "strata-wal-{}-{}-{}.log",
+            "cairn-wal-{}-{}-{}.log",
             tag,
             std::process::id(),
             nanos

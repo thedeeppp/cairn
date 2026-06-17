@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use strata::{Engine, Store};
+use cairn::{Engine, Store};
 
 const VALUE_LEN: usize = 100;
 
@@ -25,7 +25,7 @@ fn temp_dir(tag: &str) -> PathBuf {
         .as_nanos();
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "strata-bench-{}-{}-{}",
+        "cairn-bench-{}-{}-{}",
         tag,
         std::process::id(),
         nanos

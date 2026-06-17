@@ -12,6 +12,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cairn"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "rayon",
+ "serde",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -108,15 +117,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "strata"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "rayon",
- "serde",
 ]
 
 [[package]]

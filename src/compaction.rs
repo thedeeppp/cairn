@@ -69,7 +69,7 @@ mod tests {
             .as_nanos();
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "strata-compact-{}-{}-{}.sst",
+            "cairn-compact-{}-{}-{}.sst",
             tag,
             std::process::id(),
             nanos
